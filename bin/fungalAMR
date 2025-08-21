@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+
+# fungalAMR
+# Author: Jared Johnson, jared.johnson@doh.wa.gov
+
+import argparse
+import logging
+import subprocess
+import sys
+import textwrap
+import os
+import json
+import random
+import gzip
+import shutil
+import time
+from typing import List, Dict, Any, Optional, Tuple
+
+# --------------------------------
+# Logging helpers
+# --------------------------------
+LOG = logging.getLogger("fungalAMR")
+
+def setup_logging(level: str = "INFO", logfile: Optional[str] = None) -> None:
+    lv = getattr(logging, level.upper(), logging.INFO)
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+
+    handlers: List[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    if logfile:
+        os.makedirs(os.path.dirname(logfile), exist_ok=True)
+        handlers.append(logging.FileHandler(logfile, mode="a", encoding="utf-8"))
+
+    logging.basicConfig(level=lv, format=fmt, datefmt=datefmt, handlers=handlers)
+    LOG.debug("Logger initialized (level=%s, logfile=%s)", level, logfile)
+
+class StepTimer:
+    def __init__(self, name: str):
+        self.name = name
+        self.t0 = 0.0
+
+    def __enter__(self):
+        self.t0 = time.perf_counter()
+        LOG.info("%s: start", self.name)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        dt = time.perf_counter() - self.t0
+        if exc:
+            LOG.error("%s: failed after %.2fs", self.name, dt)
+        else:
+            LOG.info("%s: done in %.2fs", self.name, dt)
+
+def _human_bytes(n: int) -> str:
+    for unit in ["B","KB","MB","GB","TB"]:
+        if n < 1024.0:
+            return f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}PB"
+
+def _file_info(path: str) -> str:
+    try:
+        sz = os.path.getsize(path)
+        return f"{path} ({_human_bytes(sz)})"
+    except Exception:
+        return path
+
+# --------------------------------
+# Subprocess
+# --------------------------------
+def run(cmd: List[str] | str, *, stdout=None, stderr=None, shell: bool = False) -> None:
+    cmd_str = cmd if isinstance(cmd, str) else " ".join(cmd)
+    LOG.debug("RUN: %s", cmd_str)
+    t0 = time.perf_counter()
+    try:
+        subprocess.run(cmd, stdout=stdout, stderr=stderr, shell=shell, check=True)
+    except subprocess.CalledProcessError as e:
+        dt = time.perf_counter() - t0
+        LOG.error("Command failed (%.2fs): %s", dt, cmd_str)
+        raise
+    dt = time.perf_counter() - t0
+    LOG.debug("OK (%.2fs): %s", dt, cmd_str)
+
+def _tool_version(tool: str) -> Optional[str]:
+    for args in (["--version"], ["version"], ["-V"], ["-v"]):
+        try:
+            out = subprocess.check_output([tool, *args], stderr=subprocess.STDOUT, text=True, timeout=5)
+            line = out.strip().splitlines()[0] if out else ""
+            return line or None
+        except Exception:
+            continue
+    return None
+
+# --------------------------------
+# Utils
+# --------------------------------
+def checkReqs(tools: List[str]) -> None:
+    missing = [t for t in tools if shutil.which(t) is None]
+    if missing:
+        for t in missing:
+            LOG.error("Required software '%s' not found in PATH.", t)
+        sys.exit(1)
+    LOG.info("All required tools present.")
+    for t in tools:
+        ver = _tool_version(t)
+        if ver:
+            LOG.info("• %s: %s", t, ver)
+        else:
+            LOG.debug("• %s: version not available", t)
+
+# --------------------------------
+# Validation
+# --------------------------------
+def validateDb(db: List[Dict[str, Any]]) -> None:
+    """
+    Validate database JSON structure and values before building references.
+    Required top fields: acc, gene, strand, sequence, features(list)
+    Required sub fields: type, coords([start,end]); optional: phase, score, source
+    Also checks:
+      - unique (acc, gene) pairs
+      - strand is '+' or '-'
+      - coords are 1-based, start < end (ints)
+      - feature 'type' is one of {gene, mRNA, exon, CDS} (warn if other)
+    Raises ValueError on hard failures.
+    """
+    with StepTimer("Validate DB JSON"):
+        if not isinstance(db, list):
+            raise ValueError("DB JSON must be a list of gene objects.")
+
+        req_top = ["acc", "gene", "strand", "sequence", "features"]
+        req_sub = ["type", "coords"]
+        allowed_types = {"gene", "mRNA", "exon", "CDS"}
+
+        seen_pairs = set()
+        n_feat = 0
+        for i, gene in enumerate(db):
+            # Top-level presence
+            missing = [k for k in req_top if k not in gene]
+            if missing:
+                raise ValueError(f"Entry {i}: missing required fields: {missing}")
+
+            # Basic types
+            if not isinstance(gene["features"], list):
+                raise ValueError(f"Entry {i}: 'features' must be a list")
+            if not isinstance(gene["sequence"], str):
+                raise ValueError(f"Entry {i}: 'sequence' must be a string")
+            if gene["strand"] not in ("+", "-"):
+                raise ValueError(f"Entry {i}: 'strand' must be '+' or '-'")
+
+            pair = (gene["acc"], gene["gene"])
+            if pair in seen_pairs:
+                raise ValueError(f"Duplicate (acc, gene) pair: {pair} at entry {i}")
+            seen_pairs.add(pair)
+
+            # Features
+            for j, f in enumerate(gene["features"]):
+                n_feat += 1
+                if not isinstance(f, dict):
+                    raise ValueError(f"Entry {i} feature {j}: must be an object")
+                sub_missing = [k for k in req_sub if k not in f]
+                if sub_missing:
+                    raise ValueError(f"Entry {i} feature {j}: missing {sub_missing}")
+                if not isinstance(f["coords"], list) or len(f["coords"]) != 2:
+                    raise ValueError(f"Entry {i} feature {j}: 'coords' must be [start,end]")
+                try:
+                    start, end = int(f["coords"][0]), int(f["coords"][1])
+                except Exception:
+                    raise ValueError(f"Entry {i} feature {j}: coords must be integers")
+                if start < 1 or end < 1 or end <= start:
+                    raise ValueError(f"Entry {i} feature {j}: invalid coords {f['coords']} (1-based, start<end)")
+
+                ftype = str(f["type"])
+                if ftype not in allowed_types:
+                    LOG.warning("Entry %d feature %d: non-standard type '%s' (allowed: %s)",
+                                i, j, ftype, ",".join(sorted(allowed_types)))
+
+        LOG.info("DB validation passed. Genes: %d | Features: %d | Unique pairs: %d",
+                 len(db), n_feat, len(seen_pairs))
+
+# --------------------------------
+# Reference build (FASTA + GFF in one step)
+# --------------------------------
+def db2Ref(db: List[Dict[str, Any]], outdir: str) -> Tuple[str, str]:
+    """
+    Build both reference FASTA (.fa + .fai) and bgzipped/tabixed GFF3 (.gff.gz + .tbi)
+    from the validated DB JSON.
+    Returns: (fa_path, gff_gz_path)
+    """
+    fa_file = os.path.join(outdir, 'db.fa')
+    gff_file = os.path.join(outdir, 'db.gff')
+    gff_gz = gff_file + '.gz'
+
+    with StepTimer("Build FASTA + GFF + indexes"):
+        # FASTA
+        n_fa = 0
+        with open(fa_file, 'w', encoding='utf-8') as ffa:
+            for target in db:
+                gid = f"{target['acc']}_{target['gene']}"
+                seq = (target.get('sequence') or '').upper()
+                ffa.write(f">{gid}\n{seq}\n")
+                n_fa += 1
+        LOG.info("FASTA records: %d", n_fa)
+        LOG.info("FASTA: %s", _file_info(fa_file))
+        run(['samtools', 'faidx', fa_file])
+        LOG.info("FAI: %s", _file_info(fa_file + '.fai'))
+
+        # GFF
+        lines: List[str] = ["##gff-version 3"]
+        gff_cols = ['acc', 'source', 'ftype', 'start', 'end', 'score', 'strand', 'phase', 'attr']
+
+        n_gene = 0
+        n_feat = 0
+        gene_acc_seen = set()
+
+        for i, gene in enumerate(db):
+            n_gene += 1
+            acc = gene['acc']
+            gene_name = gene['gene']
+            transcript_name = gene_name + "T1"
+            gene_acc = f"{acc}_{gene_name}"
+            strand = gene['strand']
+
+            if gene_acc in gene_acc_seen:
+                # Shouldn't happen due to validation, but double-guard
+                raise ValueError(f"Multiple entries for accession {acc} and gene {gene_name} (Failure on entry {i})")
+            gene_acc_seen.add(gene_acc)
+
+            for f in gene.get('features', []):
+                n_feat += 1
+                ftype  = f['type']
+                start, end = f['coords']
+                score = str(f.get('score', '.'))
+                phase = str(f.get('phase', '.'))
+                source = f.get('source', 'custom')
+
+                row: Dict[str, Any] = {
+                    'acc': gene_acc,
+                    'source': source,
+                    'ftype': ftype,
+                    'start': start,
+                    'end': end,
+                    'score': score,
+                    'strand': strand,
+                    'phase': phase,
+                }
+
+                if ftype == "gene":
+                    attr = f'ID=gene:{gene_name};biotype=protein_coding'
+                elif ftype and ftype.lower() == "mrna":
+                    attr = f'ID=transcript:{transcript_name};Parent=gene:{gene_name};biotype=protein_coding'
+                elif ftype and ftype.lower() in ["exon", "cds"]:
+                    attr = f'Parent=transcript:{transcript_name}'
+                else:
+                    # already warned in validation; skip writing unknowns
+                    LOG.debug("Skipping feature with unsupported type: %s", ftype)
+                    continue
+
+                row['attr'] = attr
+                lines.append('\t'.join(str(row[c]) for c in gff_cols))
+
+        with open(gff_file, 'w', encoding='utf-8') as fg:
+            fg.write('\n'.join(lines) + '\n')
+
+        LOG.info("Genes: %d | Features written: %d", n_gene, n_feat)
+        LOG.info("GFF (plain): %s", _file_info(gff_file))
+        run(['bgzip', '-f', gff_file])
+        run(['tabix', '-p', 'gff', gff_gz])
+        LOG.info("GFF (bgz): %s", _file_info(gff_gz))
+
+    return fa_file, gff_gz
+
+# --------------------------------
+# Variant/align pipeline steps
+# --------------------------------
+def annotateVcf(vcf: str, fa: str, gff_gz: str, outdir: str, log_dir: str) -> str:
+    vcf_out = os.path.join(outdir, 'db.anno.vcf')
+    stderr_log = os.path.join(log_dir, "bcftools_csq.log")
+    with StepTimer("Annotate variants (bcftools csq)"):
+        LOG.info("Input VCF: %s", _file_info(vcf))
+        LOG.info("Ref FASTA: %s", _file_info(fa))
+        LOG.info("GFF (bgzip+tabix): %s", _file_info(gff_gz))
+        with open(vcf_out, 'w') as out, open(stderr_log, 'w') as err:
+            run([
+                'bcftools', 'csq',
+                '-p', 's',
+                '-f', fa,
+                '-g', gff_gz,
+                vcf
+            ], stdout=out, stderr=err)
+        LOG.info("Annotated VCF: %s", _file_info(vcf_out))
+    return vcf_out
+
+def _parse_info_field(info_str: str) -> Dict[str, str]:
+    d: Dict[str, str] = {}
+    if not info_str or info_str == '.':
+        return d
+    for item in info_str.split(';'):
+        if '=' in item:
+            k, v = item.split('=', 1)
+            d[k] = v
+        elif item:
+            d[item] = 'True'
+    return d
+
+def filterVcf(vcf_path: str, outdir: str, qual: float = 100, dp: int = 10) -> str:
+    """
+    Keep variants with QUAL > qual, DP > dp, and with BCSQ annotations.
+    Also writes a simple CSV of parsed mutations.
+    """
+    vcf_filt = os.path.join(outdir, "db.filt.vcf")
+    mut_file = os.path.join(outdir, "mutations.csv")
+    expr = f'QUAL>{qual} && INFO/DP>{dp} && INFO/BCSQ!=""'
+    with StepTimer("Filter VCF + extract mutations"):
+        LOG.info("Filter expr: %s", expr)
+        LOG.info("Input VCF: %s", _file_info(vcf_path))
+        run(["bcftools", "view", "-i", expr, "-o", vcf_filt, "-O", "v", vcf_path])
+        LOG.info("Filtered VCF: %s", _file_info(vcf_filt))
+
+        muts = [['gene','impact','mutation_prot','mutation_dna','quality','dp','reference']]
+        n_records = 0
+        n_entries = 0
+        with open(vcf_filt, 'r', encoding='utf-8') as f:
+            for line in f:
+                if not line or line.startswith('#'):
+                    continue
+                n_records += 1
+                cols = line.rstrip('\n').split('\t')
+                if len(cols) < 8:
+                    continue
+                chrom = cols[0]
+                qual_str = cols[5]
+                info_str = cols[7]
+                try:
+                    v_qual = float(qual_str) if qual_str != '.' else None
+                except ValueError:
+                    v_qual = None
+                info = _parse_info_field(info_str)
+                try:
+                    v_dp = int(info.get('DP')) if info.get('DP') is not None else None
+                except ValueError:
+                    v_dp = None
+                bcsq = info.get('BCSQ')
+                if not bcsq:
+                    continue
+                for entry in str(bcsq).split(','):
+                    fields = entry.split('|')
+                    impact   = fields[0] if len(fields) > 0 else ''
+                    gene     = fields[1] if len(fields) > 1 else ''
+                    mut_prot = fields[5] if len(fields) > 5 else ''
+                    mut_dna  = fields[6] if len(fields) > 6 else ''
+                    muts.append([
+                        gene, impact, mut_prot, mut_dna,
+                        '' if v_qual is None else str(v_qual),
+                        '' if v_dp   is None else str(v_dp),
+                        str(chrom)
+                    ])
+                    n_entries += 1
+
+        with open(mut_file, 'w', encoding='utf-8') as out:
+            out.write('\n'.join(','.join(row) for row in muts) + '\n')
+
+        LOG.info("VCF records parsed: %d", n_records)
+        LOG.info("Mutations written:  %d", n_entries)
+        LOG.info("Mutations CSV: %s", _file_info(mut_file))
+    return vcf_filt
+
+def callVars(fa: str, bam: str, outdir: str, log_dir: str) -> str:
+    vcf = os.path.join(outdir, "db.vcf")
+    stderr_log = os.path.join(log_dir, "freebayes.log")
+    if os.path.exists(vcf):
+        LOG.info("Variant calling skipped (exists): %s", _file_info(vcf))
+        return vcf
+    with StepTimer("Call variants (FreeBayes)"):
+        command = [
+            "freebayes",
+            "-f", fa,
+            "--ploidy", "2",
+            "--genotype-qualities",
+            "--report-monomorphic",
+            "--use-best-n-alleles", "2",
+            "--min-coverage", "10",
+            "--min-alternate-fraction", "0.1",
+            "--report-all-haplotype-alleles",
+            "--gvcf",
+            bam
+        ]
+        LOG.info("Ref FASTA: %s", _file_info(fa))
+        LOG.info("Input BAM: %s", _file_info(bam))
+        with open(vcf, 'w') as out, open(stderr_log, 'w') as err:
+            run(command, stdout=out, stderr=err)
+        LOG.info("Raw VCF: %s", _file_info(vcf))
+    return vcf
+
+def align2Db(fa: str, reads: List[str], outdir: str, log_dir: str) -> str:
+    bam_file = os.path.join(outdir, 'db.bam')
+    bai_file = bam_file + '.bai'
+    if os.path.exists(bam_file) and os.path.exists(bai_file):
+        LOG.info("Alignment skipped (exists): %s, %s", _file_info(bam_file), _file_info(bai_file))
+        return bam_file
+
+    with StepTimer("Align reads (bwa mem → samtools sort/index)"):
+        LOG.info("Ref FASTA: %s", _file_info(fa))
+        LOG.info("Reads: %s, %s", _file_info(reads[0]), _file_info(reads[1]))
+
+        bwa_log = os.path.join(log_dir, "bwa_index.log")
+        align_log = os.path.join(log_dir, "bwa_mem.log")
+        index_needed = not all(os.path.exists(fa + ext) for ext in ('.amb','.ann','.bwt','.pac','.sa'))
+        if index_needed:
+            LOG.info("BWA index not found; building...")
+            with open(bwa_log, 'w') as err:
+                run(["bwa", "index", fa], stdout=subprocess.DEVNULL, stderr=err)
+        else:
+            LOG.info("BWA index found; skipping index build.")
+
+        cmd = f"bwa mem {fa} {' '.join(reads)} | samtools view -b -F 4 - | samtools sort -o {bam_file}"
+        with open(align_log, 'w') as err:
+            run(cmd, shell=True, stderr=err)
+
+        run(['samtools', 'index', bam_file])
+        LOG.info("BAM: %s", _file_info(bam_file))
+        LOG.info("BAI: %s", _file_info(bai_file))
+    return bam_file
+
+def sampleReads(reads: List[str], outdir: str, max_reads: int = 1_000_000, seed: int = 42) -> List[str]:
+    """
+    Downsample paired-end FASTQ reads to a specific number of total reads using seqtk.
+    """
+    r1_out = os.path.join(outdir,'sampled_R1.fastq')
+    r2_out = os.path.join(outdir,'sampled_R2.fastq')
+
+    if os.path.exists(r1_out) and os.path.exists(r2_out):
+        LOG.info("Downsampling skipped (exists): %s, %s", _file_info(r1_out), _file_info(r2_out))
+        return [r1_out, r2_out]
+
+    with StepTimer("Downsample reads (seqtk)"):
+        LOG.info("Target total reads per file: %d  (seed=%d)", max_reads, seed)
+        r1, r2 = reads
+        LOG.info("Input R1: %s", _file_info(r1))
+        LOG.info("Input R2: %s", _file_info(r2))
+
+        cmd_r1 = ["seqtk", "sample", "-s", str(seed), r1, str(max_reads)]
+        cmd_r2 = ["seqtk", "sample", "-s", str(seed), r2, str(max_reads)]
+
+        run(cmd_r1, stdout=open(r1_out, 'w'))
+        run(cmd_r2, stdout=open(r2_out, 'w'))
+
+        run(["bgzip", "-f", r1_out])
+        run(["bgzip", "-f", r2_out])
+
+        r1_out = r1_out + '.gz'
+        r2_out = r2_out + '.gz'
+
+        LOG.info("Sampled R1: %s", _file_info(r1_out))
+        LOG.info("Sampled R2: %s", _file_info(r2_out))
+    return [r1_out, r2_out]
+
+def loadDb(json_file: str) -> List[Dict[str, Any]]:
+    with StepTimer("Load database JSON"):
+        LOG.info("DB JSON: %s", _file_info(json_file))
+        with open(json_file, 'r', encoding='utf-8') as f:
+            db = json.load(f)
+        LOG.info("Records loaded: %d", len(db) if isinstance(db, list) else 1)
+        return db
+
+# --------------------------------
+# CLI
+# --------------------------------
+def main():
+    version = "1.1"
+
+    parser = argparse.ArgumentParser(description="Align reads to an AMR gene database and call variants.")
+    parser.add_argument("--db", required=True, help="Path to AMR gene database (JSON format)")
+    parser.add_argument("--r1", required=True, help="Path to first read file (.fastq.gz)")
+    parser.add_argument("--r2", required=True, help="Path to second read file (.fastq.gz)")
+    parser.add_argument("--outdir", default="results", help="Output directory (default: results)")
+    parser.add_argument("--qual", type=float, default=100, help="Minimum QUAL score for variants (default: 100)")
+    parser.add_argument("--dp", type=int, default=10, help="Minimum depth (DP) for variants (default: 10)")
+    parser.add_argument("--max_reads", type=int, default=100_000_000, help="Maximum number of reads to sample (default: 100,000,000)")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR"], help="Logging level")
+    parser.add_argument("--log-file", default=None, help="Write logs to this file (in addition to stdout)")
+    parser.add_argument('--version', action='version', version=f'%(prog)s {version}')
+    args = parser.parse_args()
+
+    # Prepare paths
+    outdir = args.outdir
+    os.makedirs(outdir, exist_ok=True)
+    log_dir = os.path.join(outdir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Logging setup
+    logfile = args.log_file or os.path.join(log_dir, "pipeline.log")
+    setup_logging(args.log_level, logfile)
+
+    LOG.info(textwrap.dedent(f"""
+        -----------------------------
+        fungalAMR v{version}
+        -----------------------------
+        outdir: {outdir}
+        logs:   {log_dir}
+    """).strip())
+
+    with StepTimer("Prereq check"):
+        checkReqs(["freebayes", "bcftools", "bwa", "samtools", "tabix", "bgzip", "seqtk"])
+
+    with StepTimer("Main workflow"):
+        db = loadDb(args.db)
+
+        # 1) Validate DB JSON BEFORE building references
+        validateDb(db)
+
+        # 2) Build both FASTA and GFF in a single step
+        db_fa, db_gff_gz = db2Ref(db, outdir)
+
+        # 3) Remainder of pipeline
+        reads  = sampleReads([args.r1, args.r2], outdir, max_reads=args.max_reads)
+        db_bam = align2Db(db_fa, reads, outdir, log_dir)
+        vcf    = callVars(db_fa, db_bam, outdir, log_dir)
+        vcf_anno = annotateVcf(vcf, db_fa, db_gff_gz, outdir, log_dir)
+        _vcf_filt = filterVcf(vcf_anno, outdir, qual=args.qual, dp=args.dp)
+
+    LOG.info("Pipeline complete")
+
+if __name__ == "__main__":
+    main()
