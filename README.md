@@ -31,7 +31,7 @@ python gff2db.py \
     ]
 ```
 4. Detect variants
-Example reads can be downloaded with `fasterq-dump -S SRR14996559`
+- Example reads can be downloaded with `fasterq-dump -S SRR14996559`
 ```
 ./fungalAMR \\
     --db genes.json \\
