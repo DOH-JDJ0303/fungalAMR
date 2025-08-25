@@ -14,6 +14,7 @@ import random
 import gzip
 import shutil
 import time
+import tempfile
 from typing import List, Dict, Any, Optional, Tuple
 
 # --------------------------------
@@ -74,7 +75,7 @@ def run(cmd: List[str] | str, *, stdout=None, stderr=None, shell: bool = False) 
     t0 = time.perf_counter()
     try:
         subprocess.run(cmd, stdout=stdout, stderr=stderr, shell=shell, check=True)
-    except subprocess.CalledProcessError as e:
+    except subprocess.CalledProcessError:
         dt = time.perf_counter() - t0
         LOG.error("Command failed (%.2fs): %s", dt, cmd_str)
         raise
@@ -180,6 +181,7 @@ def validateDb(db: List[Dict[str, Any]]) -> None:
 # --------------------------------
 # Reference build (FASTA + GFF in one step)
 # --------------------------------
+
 def db2Ref(db: List[Dict[str, Any]], outdir: str) -> Tuple[str, str]:
     """
     Build both reference FASTA (.fa + .fai) and bgzipped/tabixed GFF3 (.gff.gz + .tbi)
@@ -204,13 +206,15 @@ def db2Ref(db: List[Dict[str, Any]], outdir: str) -> Tuple[str, str]:
         run(['samtools', 'faidx', fa_file])
         LOG.info("FAI: %s", _file_info(fa_file + '.fai'))
 
-        # GFF
+        # GFF & target map
         lines: List[str] = ["##gff-version 3"]
         gff_cols = ['acc', 'source', 'ftype', 'start', 'end', 'score', 'strand', 'phase', 'attr']
 
         n_gene = 0
         n_feat = 0
         gene_acc_seen = set()
+
+        tmap: Dict[str, List[Tuple[str, int, int]]] = {}
 
         for i, gene in enumerate(db):
             n_gene += 1
@@ -258,6 +262,20 @@ def db2Ref(db: List[Dict[str, Any]], outdir: str) -> Tuple[str, str]:
                 row['attr'] = attr
                 lines.append('\t'.join(str(row[c]) for c in gff_cols))
 
+            regions = []
+            for t in gene.get("targets", []) or []:
+                try:
+                    name = str(t["name"])
+                    start, end = int(t["coords"][0]), int(t["coords"][1])
+                    if start > end:
+                        start, end = end, start
+                    regions.append((name, start, end))
+                except Exception:
+                    continue
+            if regions:
+                # sort for deterministic behavior
+                tmap[gene_acc] = sorted(regions, key=lambda x: (x[1], x[2], x[0]))
+
         with open(gff_file, 'w', encoding='utf-8') as fg:
             fg.write('\n'.join(lines) + '\n')
 
@@ -267,12 +285,12 @@ def db2Ref(db: List[Dict[str, Any]], outdir: str) -> Tuple[str, str]:
         run(['tabix', '-p', 'gff', gff_gz])
         LOG.info("GFF (bgz): %s", _file_info(gff_gz))
 
-    return fa_file, gff_gz
+    return fa_file, gff_gz, tmap
 
 # --------------------------------
 # Variant/align pipeline steps
 # --------------------------------
-def annotateVcf(vcf: str, fa: str, gff_gz: str, outdir: str, log_dir: str) -> str:
+def annotateVcf(vcf: str, fa: str, gff_gz: str, outdir: str, log_dir: str, *, threads: int) -> str:
     vcf_out = os.path.join(outdir, 'db.anno.vcf')
     stderr_log = os.path.join(log_dir, "bcftools_csq.log")
     with StepTimer("Annotate variants (bcftools csq)"):
@@ -282,6 +300,7 @@ def annotateVcf(vcf: str, fa: str, gff_gz: str, outdir: str, log_dir: str) -> st
         with open(vcf_out, 'w') as out, open(stderr_log, 'w') as err:
             run([
                 'bcftools', 'csq',
+                '--threads', str(threads),
                 '-p', 's',
                 '-f', fa,
                 '-g', gff_gz,
@@ -302,23 +321,44 @@ def _parse_info_field(info_str: str) -> Dict[str, str]:
             d[item] = 'True'
     return d
 
-def filterVcf(vcf_path: str, outdir: str, qual: float = 100, dp: int = 10) -> str:
+def filterVcf(
+    vcf_path: str,
+    outdir: str,
+    *,
+    qual: float,
+    dp: int,
+    threads: int,                       # kept for interface symmetry; not used by bcftools view
+    targets_map: Dict[str, List[Tuple[str, int, int]]],
+) -> str:
     """
-    Keep variants with QUAL > qual, DP > dp, and with BCSQ annotations.
-    Also writes a simple CSV of parsed mutations.
+    Keep variants with QUAL > qual, DP > dp, and BCSQ annotations.
+    Always output them; add 'region' with hs1/hs2/hs3 (semicolon-joined) if POS is inside
+    any target window for its CHROM; otherwise region is ''.
     """
     vcf_filt = os.path.join(outdir, "db.filt.vcf")
     mut_file = os.path.join(outdir, "mutations.csv")
     expr = f'QUAL>{qual} && INFO/DP>{dp} && INFO/BCSQ!=""'
-    with StepTimer("Filter VCF + extract mutations"):
+
+    with StepTimer("Filter VCF + extract mutations (label target regions)"):
         LOG.info("Filter expr: %s", expr)
         LOG.info("Input VCF: %s", _file_info(vcf_path))
+
+        # IMPORTANT: keep as you had it — no threads flag for bcftools view
         run(["bcftools", "view", "-i", expr, "-o", vcf_filt, "-O", "v", vcf_path])
         LOG.info("Filtered VCF: %s", _file_info(vcf_filt))
 
-        muts = [['gene','impact','mutation_prot','mutation_dna','quality','dp','reference']]
+        muts = [['gene','impact','mutation_prot','mutation_dna','quality','dp','reference','region']]
         n_records = 0
         n_entries = 0
+        n_in_targets = 0
+
+        def _regions_for(chrom: str, pos: int) -> List[str]:
+            hits = []
+            for name, s, e in targets_map.get(chrom, []):
+                if s <= pos <= e:  # 1-based inclusive
+                    hits.append(name)
+            return hits
+
         with open(vcf_filt, 'r', encoding='utf-8') as f:
             for line in f:
                 if not line or line.startswith('#'):
@@ -327,21 +367,36 @@ def filterVcf(vcf_path: str, outdir: str, qual: float = 100, dp: int = 10) -> st
                 cols = line.rstrip('\n').split('\t')
                 if len(cols) < 8:
                     continue
+
                 chrom = cols[0]
+                try:
+                    pos = int(cols[1])
+                except ValueError:
+                    continue
+
                 qual_str = cols[5]
                 info_str = cols[7]
+
                 try:
                     v_qual = float(qual_str) if qual_str != '.' else None
                 except ValueError:
                     v_qual = None
+
                 info = _parse_info_field(info_str)
                 try:
                     v_dp = int(info.get('DP')) if info.get('DP') is not None else None
                 except ValueError:
                     v_dp = None
+
+                region_hits = _regions_for(chrom, pos)
+                if region_hits:
+                    n_in_targets += 1
+                region_label = ';'.join(region_hits) if region_hits else ''
+
                 bcsq = info.get('BCSQ')
                 if not bcsq:
                     continue
+
                 for entry in str(bcsq).split(','):
                     fields = entry.split('|')
                     impact   = fields[0] if len(fields) > 0 else ''
@@ -352,7 +407,8 @@ def filterVcf(vcf_path: str, outdir: str, qual: float = 100, dp: int = 10) -> st
                         gene, impact, mut_prot, mut_dna,
                         '' if v_qual is None else str(v_qual),
                         '' if v_dp   is None else str(v_dp),
-                        str(chrom)
+                        chrom,
+                        region_label
                     ])
                     n_entries += 1
 
@@ -360,9 +416,12 @@ def filterVcf(vcf_path: str, outdir: str, qual: float = 100, dp: int = 10) -> st
             out.write('\n'.join(','.join(row) for row in muts) + '\n')
 
         LOG.info("VCF records parsed: %d", n_records)
+        LOG.info("Records in targets: %d", n_in_targets)
         LOG.info("Mutations written:  %d", n_entries)
         LOG.info("Mutations CSV: %s", _file_info(mut_file))
+
     return vcf_filt
+
 
 def callVars(fa: str, bam: str, outdir: str, log_dir: str) -> str:
     vcf = os.path.join(outdir, "db.vcf")
@@ -391,14 +450,14 @@ def callVars(fa: str, bam: str, outdir: str, log_dir: str) -> str:
         LOG.info("Raw VCF: %s", _file_info(vcf))
     return vcf
 
-def align2Db(fa: str, reads: List[str], outdir: str, log_dir: str) -> str:
+def align2Db(fa: str, reads: List[str], outdir: str, log_dir: str, *, threads: int) -> str:
     bam_file = os.path.join(outdir, 'db.bam')
     bai_file = bam_file + '.bai'
     if os.path.exists(bam_file) and os.path.exists(bai_file):
         LOG.info("Alignment skipped (exists): %s, %s", _file_info(bam_file), _file_info(bai_file))
         return bam_file
 
-    with StepTimer("Align reads (bwa mem → samtools sort/index)"):
+    with StepTimer("Align reads (bwa mem → samtools view/sort/index)"):
         LOG.info("Ref FASTA: %s", _file_info(fa))
         LOG.info("Reads: %s, %s", _file_info(reads[0]), _file_info(reads[1]))
 
@@ -408,29 +467,34 @@ def align2Db(fa: str, reads: List[str], outdir: str, log_dir: str) -> str:
         if index_needed:
             LOG.info("BWA index not found; building...")
             with open(bwa_log, 'w') as err:
+                # bwa index has no threads option
                 run(["bwa", "index", fa], stdout=subprocess.DEVNULL, stderr=err)
         else:
             LOG.info("BWA index found; skipping index build.")
 
-        cmd = f"bwa mem {fa} {' '.join(reads)} | samtools view -b -F 4 - | samtools sort -o {bam_file}"
+        cmd = (
+            f"bwa mem -t {threads} {fa} {' '.join(reads)} | "
+            f"samtools view -@ {threads} -b -F 4 - | "
+            f"samtools sort -@ {threads} -o {bam_file}"
+        )
         with open(align_log, 'w') as err:
             run(cmd, shell=True, stderr=err)
 
-        run(['samtools', 'index', bam_file])
+        run(['samtools', 'index', '-@', str(threads), bam_file])
         LOG.info("BAM: %s", _file_info(bam_file))
         LOG.info("BAI: %s", _file_info(bai_file))
     return bam_file
 
-def sampleReads(reads: List[str], outdir: str, max_reads: int = 1_000_000, seed: int = 42) -> List[str]:
+def sampleReads(reads: List[str], outdir: str, *, max_reads: int = 1_000_000, seed: int = 42, threads: int) -> List[str]:
     """
     Downsample paired-end FASTQ reads to a specific number of total reads using seqtk.
     """
     r1_out = os.path.join(outdir,'sampled_R1.fastq')
     r2_out = os.path.join(outdir,'sampled_R2.fastq')
 
-    if os.path.exists(r1_out) and os.path.exists(r2_out):
-        LOG.info("Downsampling skipped (exists): %s, %s", _file_info(r1_out), _file_info(r2_out))
-        return [r1_out, r2_out]
+    if os.path.exists(r1_out + '.gz') and os.path.exists(r2_out + '.gz'):
+        LOG.info("Downsampling skipped (exists): %s, %s", _file_info(r1_out + '.gz'), _file_info(r2_out + '.gz'))
+        return [r1_out + '.gz', r2_out + '.gz']
 
     with StepTimer("Downsample reads (seqtk)"):
         LOG.info("Target total reads per file: %d  (seed=%d)", max_reads, seed)
@@ -444,8 +508,8 @@ def sampleReads(reads: List[str], outdir: str, max_reads: int = 1_000_000, seed:
         run(cmd_r1, stdout=open(r1_out, 'w'))
         run(cmd_r2, stdout=open(r2_out, 'w'))
 
-        run(["bgzip", "-f", r1_out])
-        run(["bgzip", "-f", r2_out])
+        run(["bgzip", "-@", str(threads), "-f", r1_out])
+        run(["bgzip", "-@", str(threads), "-f", r2_out])
 
         r1_out = r1_out + '.gz'
         r2_out = r2_out + '.gz'
@@ -462,24 +526,185 @@ def loadDb(json_file: str) -> List[Dict[str, Any]]:
         LOG.info("Records loaded: %d", len(db) if isinstance(db, list) else 1)
         return db
 
+def locateRegions(db_fa, ref, outdir, log_dir, *, flank=1000, threads: int) -> str:
+    """
+    Align db_fa to ref (target) with minimap2 and emit a BED of regions
+    upstream of each target-alignment start: [max(0, tstart-flank), tstart].
+
+    Returns the BED file path.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    paf_file = os.path.join(outdir, "ref.paf")
+    bed_file = os.path.join(outdir, "ref.bed")
+
+    with StepTimer("Locate target regions in reference."):
+        # Run minimap2 -> PAF
+        cmd = ["minimap2", "-t", str(threads), "-x", "asm5", str(ref), str(db_fa)]
+        with open(paf_file, "w") as paf_out:
+            run(cmd, stdout=paf_out)
+
+        regions = set()  # (tname, start, end)
+
+        with open(paf_file, "r") as paf_in:
+            for line in paf_in:
+                if not line.strip():
+                    continue
+                f = line.rstrip("\n").split("\t")
+                if len(f) < 12:
+                    continue
+
+                tags = {kv.split(":", 2)[0]: kv for kv in f[12:]}
+                if "tp" in tags and not tags["tp"].endswith(":P"):
+                    continue
+                try:
+                    mapq = int(f[11])
+                except ValueError:
+                    mapq = 0
+                if mapq < 1:
+                    continue
+
+                tname = f[5]
+                try:
+                    qlen   = int(f[1])
+                    qstart = int(f[2])
+                    qend   = int(f[3])
+                    tlen   = int(f[6])
+                    tstart = int(f[7])
+                    tend   = int(f[8])
+                except ValueError:
+                    continue
+
+                start = max(0, tstart - qstart - flank)
+                end   = min(tend + (qlen - qend) + flank, tlen )
+                if end <= start:
+                    continue
+
+                regions.add((tname, start, end))
+
+        # Sort and write BED
+        if regions:
+            sorted_regions = sorted(regions, key=lambda x: (x[0], x[1], x[2]))
+            with open(bed_file, "w") as bed_out:
+                for tname, s, e in sorted_regions:
+                    bed_out.write(f"{tname}\t{s}\t{e}\n")
+        else:
+            open(bed_file, "w").close()
+
+    return bed_file
+
+def subset_bam_with_mates(input_bam: str, bed_file: str, outdir: str, *, require_mapq: int | None = None, threads: int) -> tuple[str, str]:
+    import tempfile
+    os.makedirs(outdir, exist_ok=True)
+    overlap_bam_unsorted = os.path.join(outdir, "regions.overlap.unsorted.bam")
+    overlap_bam = os.path.join(outdir, "regions.overlap.bam")
+    plus_mates_bam_unsorted = os.path.join(outdir, "regions.plus_mates.unsorted.bam")
+    plus_mates_bam = os.path.join(outdir, "regions.plus_mates.bam")
+
+    with StepTimer("Subset BAM to regions (+ optional MAPQ)"):
+        # 1) Overlaps only → UNSORTED
+        view_cmd = ["samtools", "view", "-@", str(threads), "-b", "-h", "-L", bed_file]
+        if require_mapq is not None:
+            view_cmd += ["-q", str(require_mapq)]
+        view_cmd += [input_bam]
+        with open(overlap_bam_unsorted, "wb") as outfh:
+            run(view_cmd, stdout=outfh)
+
+        # Sort & index
+        run(["samtools", "sort", "-@", str(threads), "-o", overlap_bam, overlap_bam_unsorted])
+        run(["samtools", "index", "-@", str(threads), overlap_bam])
+        try: os.remove(overlap_bam_unsorted)
+        except OSError: pass
+
+        # 2) Collect QNAMEs from the (now sorted) overlap BAM
+        p = subprocess.run(["samtools", "view", "-@", str(threads), overlap_bam], check=True, capture_output=True, text=True)
+        qnames = {ln.split("\t", 1)[0] for ln in p.stdout.splitlines() if ln and ln[0] != "@"}
+
+        if not qnames:
+            open(plus_mates_bam, "wb").close()
+            return overlap_bam, plus_mates_bam
+
+        with tempfile.NamedTemporaryFile("w", delete=False, prefix="names_", suffix=".txt") as tf:
+            names_path = tf.name
+            tf.write("\n".join(sorted(qnames)) + "\n")
+
+        try:
+            # Pull mates → UNSORTED
+            with open(plus_mates_bam_unsorted, "wb") as outfh:
+                run(["samtools", "view", "-@", str(threads), "-b", "-h", "-N", names_path, input_bam], stdout=outfh)
+
+            # Sort & index
+            run(["samtools", "sort", "-@", str(threads), "-o", plus_mates_bam, plus_mates_bam_unsorted])
+            run(["samtools", "index", "-@", str(threads), plus_mates_bam])
+        finally:
+            try: os.remove(names_path)
+            except OSError: pass
+            try: os.remove(plus_mates_bam_unsorted)
+            except OSError: pass
+
+    return overlap_bam, plus_mates_bam
+
+
+def extractReads(bam: str, outdir: str, log_dir: str, *, threads: int) -> List[str]:
+    """
+    Convert a BAM to paired FASTQs for re-alignment with bwa mem.
+    Returns [r1_fastq_gz, r2_fastq_gz]. Singles (if any) are written but not returned.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    name_bam = os.path.join(outdir, "subset.name.bam")
+    r1 = os.path.join(outdir, "subset_R1.fastq")
+    r2 = os.path.join(outdir, "subset_R2.fastq")
+    singles = os.path.join(outdir, "subset_single.fastq")
+
+    with StepTimer("Extract FASTQs from BAM (name-sort → fastq)"):
+        LOG.info("Input BAM to extract: %s", _file_info(bam))
+        run(["samtools", "sort", "-@", str(threads), "-n", "-o", name_bam, bam])
+        LOG.info("Name-sorted BAM: %s", _file_info(name_bam))
+
+        # Write paired + singles; drop orphan outputs to /dev/null for cleanliness if desired
+        run([
+            "samtools", "fastq",
+            "-@", str(threads),
+            "-1", r1, "-2", r2,
+            "-s", singles,
+            "-0", "/dev/null",
+            "-n",
+            name_bam
+        ])
+        LOG.info("R1: %s", _file_info(r1))
+        LOG.info("R2: %s", _file_info(r2))
+        LOG.info("Singles (kept): %s", _file_info(singles))
+
+        # gzip outputs for downstream bwa mem convenience
+        run(["bgzip", "-@", str(threads), "-f", r1])
+        run(["bgzip", "-@", str(threads), "-f", r2])
+        run(["bgzip", "-@", str(threads), "-f", singles])
+
+    return [r1 + ".gz", r2 + ".gz"]
+
+
 # --------------------------------
 # CLI
 # --------------------------------
 def main():
-    version = "1.1"
+    version = "1.2"
 
     parser = argparse.ArgumentParser(description="Align reads to an AMR gene database and call variants.")
     parser.add_argument("--db", required=True, help="Path to AMR gene database (JSON format)")
-    parser.add_argument("--r1", required=True, help="Path to first read file (.fastq.gz)")
-    parser.add_argument("--r2", required=True, help="Path to second read file (.fastq.gz)")
+    parser.add_argument("--r1", help="Path to first read file (.fastq.gz)")
+    parser.add_argument("--r2", help="Path to second read file (.fastq.gz)")
+    parser.add_argument("--bam", help="Path to read alignment file (BAM). Must be supplied with reference. Cannot be supplied with 'r1 / r2'")
+    parser.add_argument("--ref", help="Path to reference file (FASTA) used to generate the read alignment (BAM).")
     parser.add_argument("--outdir", default="results", help="Output directory (default: results)")
     parser.add_argument("--qual", type=float, default=100, help="Minimum QUAL score for variants (default: 100)")
     parser.add_argument("--dp", type=int, default=10, help="Minimum depth (DP) for variants (default: 10)")
     parser.add_argument("--max_reads", type=int, default=100_000_000, help="Maximum number of reads to sample (default: 100,000,000)")
+    parser.add_argument("--threads", type=int, default=(os.cpu_count() or 1), help="Threads for tools that support it (default: CPU count)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR"], help="Logging level")
     parser.add_argument("--log-file", default=None, help="Write logs to this file (in addition to stdout)")
     parser.add_argument('--version', action='version', version=f'%(prog)s {version}')
     args = parser.parse_args()
+
+    threads = max(1, int(args.threads))
 
     # Prepare paths
     outdir = args.outdir
@@ -495,28 +720,59 @@ def main():
         -----------------------------
         fungalAMR v{version}
         -----------------------------
-        outdir: {outdir}
-        logs:   {log_dir}
+        outdir:  {outdir}
+        logs:    {log_dir}
+        threads: {threads}
     """).strip())
 
     with StepTimer("Prereq check"):
-        checkReqs(["freebayes", "bcftools", "bwa", "samtools", "tabix", "bgzip", "seqtk"])
+        checkReqs(["freebayes", "bcftools", "bwa", "samtools", "tabix", "bgzip", "seqtk", 'minimap2'])
 
     with StepTimer("Main workflow"):
-        db = loadDb(args.db)
-
-        # 1) Validate DB JSON BEFORE building references
+        db               = loadDb(args.db)
         validateDb(db)
+        db_fa, db_gff_gz, targets_map = db2Ref(db, outdir)
 
-        # 2) Build both FASTA and GFF in a single step
-        db_fa, db_gff_gz = db2Ref(db, outdir)
+        if not targets_map:
+            LOG.warning("No target regions found in DB JSON; downstream mutation table will be empty.")
 
         # 3) Remainder of pipeline
-        reads  = sampleReads([args.r1, args.r2], outdir, max_reads=args.max_reads)
-        db_bam = align2Db(db_fa, reads, outdir, log_dir)
-        vcf    = callVars(db_fa, db_bam, outdir, log_dir)
-        vcf_anno = annotateVcf(vcf, db_fa, db_gff_gz, outdir, log_dir)
-        _vcf_filt = filterVcf(vcf_anno, outdir, qual=args.qual, dp=args.dp)
+        if (args.r1 or args.r2) and (args.bam or args.ref):
+            raise ValueError("Cannot use 'r1/r2' together with 'bam/ref'.")
+
+        # Ensure paired reads come as a pair
+        if (args.r1 and not args.r2) or (args.r2 and not args.r1):
+            raise ValueError("Both --r1 and --r2 must be supplied together for FASTQ input.")
+
+        if args.r1 and args.r2:
+            # FASTQ route: optional downsample, then align
+            reads  = sampleReads([args.r1, args.r2], outdir, max_reads=args.max_reads, seed=42, threads=threads)
+        elif args.bam and args.ref:
+            # BAM+REF route:
+            # 1) Locate regions where DB aligns on the reference
+            ref_regions = locateRegions(db_fa, args.ref, outdir, log_dir, flank=1000, threads=threads)
+
+            # 2) Subset BAM to those regions and include mates
+            overlap_bam, plus_mates_bam = subset_bam_with_mates(args.bam, ref_regions, outdir, require_mapq=1, threads=threads)
+
+            # 3) Convert the plus-mates BAM to FASTQs for re-alignment to the DB
+            reads = extractReads(plus_mates_bam, outdir, log_dir, threads=threads)
+        else:
+            raise ValueError("Provide either --r1/--r2 (FASTQs) OR --bam and --ref (BAM path).")
+
+        # 4) Align extracted/selected reads to the DB FASTA
+        db_bam   = align2Db(db_fa, reads, outdir, log_dir, threads=threads)
+        vcf      = callVars(db_fa, db_bam, outdir, log_dir)
+        vcf_anno = annotateVcf(vcf, db_fa, db_gff_gz, outdir, log_dir, threads=threads)
+        _vcf_filt = filterVcf(
+            vcf_anno,
+            outdir,
+            qual=args.qual,
+            dp=args.dp,
+            threads=threads,
+            targets_map=targets_map,
+        )
+
 
     LOG.info("Pipeline complete")
 
